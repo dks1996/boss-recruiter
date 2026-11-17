@@ -42,12 +42,20 @@
 - 「status」建议使用：已打招呼 / 已回复 / 已收简历 / 待跟进 / 拒绝 / 无响应。
 
 输出文件：
-1. <岗位>_候选人评分表与台账.xlsx（三个工作表：推荐名单、评分明细、沟通台账）
-2. <岗位>_简历筛选报告.md
-3. <岗位>_沟通话术.md
-4. <岗位>_面试问题清单.md（通用题库 + 每位推荐面试候选人的个性化追问 + 面试评分表）
+1. <岗位>_去重与额度检查.md（去重结果、跳过明细、当日/当小时打招呼额度告警）
+2. <岗位>_候选人评分表与台账.xlsx（三个工作表：推荐名单、评分明细、沟通台账）
+3. <岗位>_简历筛选报告.md
+4. <岗位>_沟通话术.md
+5. <岗位>_面试问题清单.md（通用题库 + 每位推荐面试候选人的个性化追问 + 面试评分表）
 
 若 openpyxl 不可用，Excel 自动降级为三个 CSV 文件，不影响报告生成。
+
+去重与历史台账：
+- 默认台账路径：当前工作区 ./boss-recruiter-data/contact-history.json，可用 --history 覆盖。
+- 台账保存在工作区而非 skill 包内，避免候选人隐私随技能分发。
+- 运行流程：加载台账 → 按 BOSS 标识（或姓名+公司+职位）去重 → 跳过历史已沟通者 →
+  用去重后的候选人生成全部交付物 → 把本批次结果回写台账。
+- 用 --no-update-history 可只检查去重、不回写台账（适合预览）。
 """
 
 import argparse
@@ -80,6 +88,164 @@ GRADE_RULES = [
     (2.8, "C"),
     (0.0, "D"),
 ]
+
+# ---------------- 去重与沟通历史台账 ----------------
+# 历史台账默认保存在当前工作区（不放进 skill 包），避免候选人隐私随技能分发。
+# 结论为以下任一值的记录永久跳过，不再重复沟通。
+FINAL_OUTCOMES = {"通过", "已录用", "已入职", "已发offer", "未通过", "已淘汰",
+                  "不合适", "拒绝", "候选人拒绝", "黑名单"}
+
+
+def normalize_identity(c):
+    """候选人唯一标识：优先 BOSS 标识，其次「姓名+公司+当前职位」。"""
+    bid = str(c.get("boss_id") or "").strip()
+    if bid and bid != "-":
+        return "boss:" + bid.lower()
+    name = str(c.get("name") or "").strip()
+    company = str(c.get("company") or "").strip()
+    title = str(c.get("current_title") or "").strip()
+    if name and name != "-":
+        return "np:" + "|".join([name.lower(), company.lower(), title.lower()])
+    return None
+
+
+def derive_outcome(c):
+    """从 outcome 或 status 推导沟通结论。"""
+    if c.get("outcome"):
+        return str(c["outcome"]).strip()
+    s = str(c.get("status") or "")
+    table = [("已录用", "通过"), ("入职", "通过"), ("offer", "通过"), ("通过", "通过"),
+             ("淘汰", "未通过"), ("未通过", "未通过"), ("不合适", "未通过"),
+             ("拒绝", "拒绝"), ("无响应", "无响应"), ("已收简历", "沟通中"),
+             ("已回复", "沟通中"), ("已打招呼", "沟通中")]
+    for kw, out in table:
+        if kw in s:
+            return out
+    return "沟通中"
+
+
+def parse_dt(value):
+    if not value:
+        return None
+    s = str(value).strip()
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def load_history(path):
+    if not path or not Path(path).exists():
+        return {"version": 1, "updated_at": "", "job": "", "records": []}
+    try:
+        d = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            raise ValueError
+        d.setdefault("version", 1)
+        d.setdefault("records", [])
+        d.setdefault("updated_at", "")
+        d.setdefault("job", "")
+        return d
+    except Exception:
+        return {"version": 1, "updated_at": "", "job": "", "records": []}
+
+
+def history_index(history):
+    idx = {}
+    for r in history.get("records", []):
+        ident = normalize_identity(r)
+        if ident:
+            idx[ident] = r
+    return idx
+
+
+def is_blocked(rec, today, recontact_no_response_days=0):
+    """判断历史记录是否应阻止再次沟通。"""
+    outcome = str(rec.get("outcome") or derive_outcome(rec))
+    if outcome in FINAL_OUTCOMES:
+        return True
+    ra = rec.get("recontact_after")
+    if ra:
+        d = parse_dt(ra)
+        if d and d.date() <= today:
+            return False
+    if outcome == "无响应" and recontact_no_response_days > 0:
+        last = parse_dt(rec.get("last_contact")) or parse_dt(rec.get("first_contact"))
+        if last and (today - last.date()).days >= recontact_no_response_days:
+            return False
+    return True
+
+
+def dedup(candidates, index, today, recontact_no_response_days=0):
+    """返回 (可沟通候选人, 跳过列表)。跳过项为 (候选人, 历史记录, 原因)。"""
+    fresh, skipped, seen = [], [], set()
+    for c in candidates:
+        ident = normalize_identity(c)
+        if ident and ident in seen:
+            skipped.append((c, {"outcome": "本批次重复"}, "本批次搜索结果中重复出现"))
+            continue
+        if ident:
+            seen.add(ident)
+        rec = index.get(ident) if ident else None
+        if rec and is_blocked(rec, today, recontact_no_response_days):
+            reason = f"历史已沟通（{rec.get('outcome') or derive_outcome(rec)}）"
+            if rec.get("last_contact"):
+                reason += f"，上次 {rec['last_contact']}"
+            skipped.append((c, rec, reason))
+            continue
+        fresh.append(c)
+    return fresh, skipped
+
+
+def merge_history(history, fresh, today, date_str):
+    """把本批次候选人的沟通结果合并进历史台账。"""
+    idx = history_index(history)
+    job = history.get("job") or "-"
+    for c in fresh:
+        ident = normalize_identity(c)
+        if not ident:
+            continue
+        rec = idx.get(ident) or {}
+        rec.update({
+            "identity": ident,
+            "name": c.get("name", "-"),
+            "boss_id": c.get("boss_id", "-"),
+            "company": c.get("company", "-"),
+            "job": c.get("job") or job,
+            "outcome": derive_outcome(c),
+            "status": c.get("status", "-"),
+            "reason": c.get("recommend_reason", "-"),
+            "first_contact": rec.get("first_contact") or c.get("last_contact") or date_str,
+            "last_contact": c.get("last_contact") or rec.get("last_contact") or date_str,
+            "notes": c.get("notes", "-"),
+        })
+        idx[ident] = rec
+    history["records"] = list(idx.values())
+    history["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    return history
+
+
+def save_history(path, history):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def contact_quota(history, today):
+    """统计历史台账中今日/当前小时已打招呼人数，用于额度告警。"""
+    today_cnt, hour_cnt = 0, 0
+    now = datetime.now()
+    for r in history.get("records", []):
+        ts = parse_dt(r.get("first_contact"))
+        if not ts:
+            continue
+        if ts.date() == today:
+            today_cnt += 1
+            if ts.hour == now.hour:
+                hour_cnt += 1
+    return hour_cnt, today_cnt
 
 
 def get(c, key, default="-"):
@@ -226,6 +392,53 @@ def write_csv_fallback(output_dir, job_title, candidates):
           for c in candidates])
 
 
+def write_dedup_report(output_dir, job_title, fresh, skipped, history_path,
+                       history_count, quota, date_str):
+    """生成去重与额度检查报告。"""
+    hour_cnt, today_cnt = quota
+    lines = [
+        f"# {job_title} — 去重与沟通额度检查",
+        "",
+        f"- 生成日期：{date_str}",
+        f"- 历史台账：`{history_path}`（现有记录 {history_count} 人）",
+        f"- 本批次输入：{len(fresh) + len(skipped)} 人",
+        f"- 去重后进入沟通/评估：{len(fresh)} 人",
+        f"- 跳过（历史已沟通 / 本批次重复）：{len(skipped)} 人",
+        "",
+        "## 当日沟通额度",
+        "",
+        f"- 今日历史已打招呼：{today_cnt} 人（红线：≤ 100）",
+        f"- 当前小时历史已打招呼：{hour_cnt} 人（红线：≤ 20）",
+    ]
+    if today_cnt >= 100 or hour_cnt >= 20:
+        lines.extend([
+            "",
+            "**⚠ 已触及当日/当小时打招呼额度红线，请立即停止本轮自动沟通，改为人工处理或次日继续。**",
+        ])
+    lines.extend(["", "## 跳过明细", ""])
+    if skipped:
+        lines.extend([
+            "| 姓名 | BOSS标识 | 历史结论 | 跳过原因 |",
+            "|------|----------|----------|----------|",
+        ])
+        for c, rec, reason in skipped:
+            lines.append(
+                f"| {get(c, 'name')} | {get(c, 'boss_id')} | "
+                f"{rec.get('outcome', '-')} | {reason} |"
+            )
+    else:
+        lines.append("本批次无重复候选人。")
+    lines.extend([
+        "",
+        "> 去重依据：优先 BOSS 标识，其次「姓名+公司+当前职位」。结论为通过/录用/未通过/淘汰/拒绝/黑名单的记录永久跳过；"
+        "无响应默认跳过，如需重新联系可设置 --recontact-no-response-days。",
+        "",
+    ])
+    path = output_dir / f"{job_title}_去重与额度检查.md"
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return path
+
+
 def write_report(output_dir, job_title, candidates, date_str):
     counts = {g: sum(1 for c in candidates if c["grade"] == g) for g in ("A", "B", "C", "D")}
     lines = [
@@ -346,6 +559,12 @@ def main():
     parser.add_argument("--input", required=True, help="候选人 JSON 文件路径")
     parser.add_argument("--output-dir", required=True, help="输出目录")
     parser.add_argument("--job", default="", help="岗位名称，覆盖 JSON 中的 job.title")
+    parser.add_argument("--history", default="",
+                        help="沟通历史台账 JSON 路径；默认 ./boss-recruiter-data/contact-history.json")
+    parser.add_argument("--no-update-history", action="store_true",
+                        help="只做去重检查，不把本批次结果回写台账")
+    parser.add_argument("--recontact-no-response-days", type=int, default=0,
+                        help="无响应候选人的重联冷却天数；0 表示永不重联（默认）")
     args = parser.parse_args()
 
     input_path = Path(args.input)
@@ -366,15 +585,42 @@ def main():
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    candidates = prepare(data)
+    # ---- 去重：加载历史台账 → 过滤已沟通者 → 只处理新候选人 ----
+    history_path = Path(args.history) if args.history else (
+        Path.cwd() / "boss-recruiter-data" / "contact-history.json"
+    )
+    history = load_history(history_path)
+    if not history.get("job") or history.get("job") == "-":
+        history["job"] = job_title
+    today = datetime.now().date()
+    all_candidates = prepare(data)
+    fresh, skipped = dedup(all_candidates, history_index(history), today,
+                           args.recontact_no_response_days)
+    quota = contact_quota(history, today)
+    dedup_path = write_dedup_report(output_dir, job_title, fresh, skipped,
+                                    history_path, len(history.get("records", [])),
+                                    quota, date_str)
+
+    # 本批次只对新候选人生成交付物
+    candidates = fresh
     excel_path, fell_back = write_excel(output_dir, job_title, candidates)
     report_path = write_report(output_dir, job_title, candidates, date_str)
     skill_root = Path(__file__).resolve().parent.parent
     template_path = write_templates(output_dir, job_title, skill_root, data)
     interview_path = write_interview_guide(output_dir, job_title, skill_root, candidates)
 
+    # ---- 回写台账：把本批次沟通结果沉淀下来，供下次去重 ----
+    if not args.no_update_history:
+        merge_history(history, candidates, today, date_str)
+        save_history(history_path, history)
+        history_note = f"历史台账已回写：{history_path}"
+    else:
+        history_note = "历史台账未回写（--no-update-history）"
+
     print(f"岗位：{job_title}")
-    print(f"候选人数量：{len(candidates)}")
+    print(f"本批次输入：{len(all_candidates)} 人｜去重后可沟通：{len(candidates)} 人｜跳过：{len(skipped)} 人")
+    print(f"去重与额度检查：{dedup_path}")
+    print(f"今日已打招呼 {quota[1]} 人（≤100）｜当前小时 {quota[0]} 人（≤20）")
     if fell_back:
         print("提示：openpyxl 不可用，已降级输出 CSV 文件")
     else:
@@ -382,6 +628,7 @@ def main():
     print(f"筛选报告：{report_path}")
     print(f"沟通话术：{template_path}")
     print(f"面试问题清单：{interview_path}")
+    print(history_note)
 
 
 if __name__ == "__main__":
