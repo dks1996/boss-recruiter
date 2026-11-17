@@ -118,7 +118,7 @@ agent_created: true
 - `references/screening-framework.md` — 候选人评分模型（权重、分级、简历深度评估表、红旗信号）。Step 3 与 Step 5 时加载。
 - `references/browser-workflow.md` — BOSS直聘浏览器自动化操作 SOP 与风控规范。Step 2 与 Step 4 时加载，操作前必须完整阅读。
 - `references/message-templates.md` — 打招呼、追问、索要简历、邀约面试、婉拒话术模板。Step 4 与生成话术交付物时加载。
-- `references/interview-questions.md` — 面试题库（财税销售岗，8 个模块含评分表）与面试红线。Step 6 生成面试问题清单时加载；用户单独要求面试问题时直接使用。
+- `references/interview-questions.md` — 面试题库（财税顾问岗，8 个模块含评分表）与面试红线。Step 6 生成面试问题清单时加载；用户单独要求面试问题时直接使用。
 
 ### scripts/
 
